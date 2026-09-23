@@ -16,12 +16,12 @@ import { getKimiUsage } from "./usage/kimi.js";
 import { getDeepseekUsage } from "./usage/deepseek.js";
 import { getOpenCodeGoUsage } from "./usage/opencode-go.js";
 import { getOpenCodeZenUsage } from "./usage/opencode-zen.js";
+import { getCommandCodeUsage } from "./usage/commandcode.js";
 import { getGroqUsage } from "./usage/groq.js";
 import { getZedUsage } from "./usage/zed.js";
 import { getXiaomiMimoUsage } from "./usage/xiaomi-mimo.js";
 import { resolveQoderCredentials } from "./qoderModels.js";
 import { getGlmUsage } from "./usage/glm.js";
-import { getCommandCodeUsage } from "./usage/commandcode.js";
 import {
   getIflowUsage,
   getOllamaUsage,
@@ -57,11 +57,11 @@ const USAGE_HANDLERS = {
   kimi: (c) => getKimiUsage(c.accessToken, c.apiKey, c.proxyOptions, c.providerSpecificData),
   "opencode-go": (c) => getOpenCodeGoUsage(c.apiKey, c.proxyOptions),
   "opencode-zen": (c) => getOpenCodeZenUsage(c.apiKey, c.proxyOptions),
+  commandcode: (c) => getCommandCodeUsage(c.apiKey, c.proxyOptions),
   deepseek: (c) => getDeepseekUsage(c.apiKey, c.proxyOptions),
   groq: (c) => getGroqUsage(c.apiKey, c.proxyOptions),
   zed: (c) => getZedUsage(c.accessToken, c.providerSpecificData, c.proxyOptions),
   "xiaomi-mimo": (c) => getXiaomiMimoUsage(c.accessToken, c.providerSpecificData, c.proxyOptions),
-  commandcode: (c) => getCommandCodeUsage(c.apiKey, c.proxyOptions),
 };
 
 // Qoder intl/CN share one usage path: PATs must be exchanged to a job token
