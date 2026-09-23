@@ -128,6 +128,7 @@ const MODEL_PREFIX_PROVIDERS = [
   [/^codex-auto-review$/, "codex"],
   [/^claude-/, "anthropic"],
   [/^gemini-/, "gemini"],
+  [/^grok-/, "xai"],
   [/^gpt-/, "openai"],
   [/^o[134]/, "openai"],
   [/^deepseek-/, "openrouter"],
