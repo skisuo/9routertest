@@ -9,50 +9,18 @@ import { buildUsage } from "../concerns/usage.js";
 import { fallbackToolCallId } from "../concerns/toolCall.js";
 import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
+import { responsesStatusFromFinishReason, finishReasonFromIncompleteReason } from "./openai-responses-json.js";
 
 /**
  * Translate OpenAI chunk to Responses API events
  * @returns {Array} Array of events with { event, data } structure
  */
-// Upstream Chat Completions usage -> Responses API usage shape.
-// Without this, /v1/responses never reports usage: Responses clients (Codex CLI)
-// keep their "context used" gauge pinned at 0 and never auto-compact, so a long
-// session grows until the upstream context limit rejects it (9router issue #3432).
-//
-// Note this is stored under state.responsesUsage, NOT state.usage: state.usage is
-// owned by the stream layer, which fills it with normalizeUsage()-shaped counts
-// (prompt_tokens/prompt_tokens_details) and hands it to finalizeStream() for
-// logging and cost accounting. Overwriting it with this shape silently drops
-// cached/reasoning tokens from those stats.
-function toResponsesUsage(usage) {
-  if (!usage || typeof usage !== "object") return null;
-
-  const inputTokens = [usage.input_tokens, usage.prompt_tokens].find(Number.isFinite) ?? 0;
-  const outputTokens = [usage.output_tokens, usage.completion_tokens].find(Number.isFinite) ?? 0;
-  const responseUsage = {
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    total_tokens: Number.isFinite(usage.total_tokens) ? usage.total_tokens : inputTokens + outputTokens
-  };
-  const cachedTokens = [usage.input_tokens_details?.cached_tokens, usage.prompt_tokens_details?.cached_tokens].find(Number.isFinite);
-  const reasoningTokens = [usage.output_tokens_details?.reasoning_tokens, usage.completion_tokens_details?.reasoning_tokens].find(Number.isFinite);
-  if (Number.isFinite(cachedTokens)) responseUsage.input_tokens_details = { cached_tokens: cachedTokens };
-  if (Number.isFinite(reasoningTokens)) responseUsage.output_tokens_details = { reasoning_tokens: reasoningTokens };
-
-  return responseUsage;
-}
-
 export function openaiToOpenAIResponsesResponse(chunk, state) {
   if (!chunk) {
     return flushEvents(state);
   }
-
-  // Capture upstream usage BEFORE the choices guard below: the last OpenAI chunk
-  // may carry usage together with an empty choices array, and it must not be dropped.
-  if (chunk.usage) {
-    state.responsesUsage = toResponsesUsage(chunk.usage);
-  }
-
+  // Chat Completions may send usage in a choices: [] chunk after finish_reason.
+  if (chunk.usage) state.responsesUsage = { ...state.responsesUsage, ...chunk.usage };
   if (!chunk.choices?.length) return [];
 
   const events = [];
@@ -143,22 +111,11 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
 
   // Handle finish_reason
   if (choice.finish_reason) {
+    state.responsesFinishReason = choice.finish_reason;
     for (const i in state.msgItemAdded) closeMessage(state, emit, i);
     closeReasoning(state, emit);
     for (const i in state.funcCallIds) closeToolCall(state, emit, i);
-    // Upstreams report usage either on the finish chunk itself or on a trailing chunk
-    // whose `choices` array is empty (OpenAI does the latter). Emitting
-    // response.completed here would freeze the payload before that trailing chunk is
-    // parsed, so when usage is not known yet we leave completion to flushEvents(),
-    // which runs once the upstream stream ends and by then has seen every chunk.
-    //
-    // That only holds on the direct openai:openai-responses route. When this converter
-    // runs as the second hop of a pivot (Claude/Gemini/Kiro upstream), translateResponse()
-    // drops the terminal null chunk before reaching us — the first hop returns null for
-    // it, leaving nothing to iterate — so flushEvents() is never called and deferring
-    // would swallow the terminal event entirely. Keep the old behaviour there.
-    const flushReachesUs = state.targetFormat === FORMATS.OPENAI;
-    if (state.responsesUsage || !flushReachesUs) sendCompleted(state, emit);
+    // Complete on stream flush so Codex receives trailing token usage as well.
   }
 
   return events;
@@ -341,7 +298,8 @@ function emitToolCall(state, emit, tc) {
         type: custom ? RESPONSES_ITEM.CUSTOM_TOOL_CALL : RESPONSES_ITEM.FUNCTION_CALL,
         ...(custom ? { input: "" } : { arguments: "" }),
         call_id: callId,
-        name: state.funcNames[tcIdx] || ""
+        name: state.funcNames[tcIdx] || "",
+        ...(state.toolNamespaces?.get(state.funcNames[tcIdx]) ? { namespace: state.toolNamespaces.get(state.funcNames[tcIdx]) } : {})
       }
     });
   }
@@ -402,7 +360,8 @@ function closeToolCall(state, emit, idx) {
         type: custom ? RESPONSES_ITEM.CUSTOM_TOOL_CALL : RESPONSES_ITEM.FUNCTION_CALL,
         ...(custom ? { input: extractCustomToolInput(args) } : { arguments: args }),
         call_id: callId,
-        name: state.funcNames[idx] || ""
+        name: state.funcNames[idx] || "",
+        ...(state.toolNamespaces?.get(state.funcNames[idx]) ? { namespace: state.toolNamespaces.get(state.funcNames[idx]) } : {})
       }
     });
 
@@ -414,16 +373,27 @@ function closeToolCall(state, emit, idx) {
 function sendCompleted(state, emit) {
   if (!state.completedSent) {
     state.completedSent = true;
-    emit("response.completed", {
-      type: "response.completed",
+    const usage = state.responsesUsage || state.usage;
+    const inputTokens = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
+    const outputTokens = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
+    const completion = responsesStatusFromFinishReason(state.responsesFinishReason);
+    const eventType = completion.status === "incomplete" ? "response.incomplete" : "response.completed";
+    emit(eventType, {
+      type: eventType,
       response: {
         id: state.responseId,
         object: "response",
         created_at: state.created,
-        status: "completed",
+        ...completion,
         background: false,
         error: null,
-        ...(state.responsesUsage ? { usage: state.responsesUsage } : {})
+        ...(usage ? { usage: {
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          total_tokens: usage.total_tokens ?? inputTokens + outputTokens,
+          input_tokens_details: { cached_tokens: usage.input_tokens_details?.cached_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? usage.cached_tokens ?? 0 },
+          output_tokens_details: { reasoning_tokens: usage.output_tokens_details?.reasoning_tokens ?? usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning_tokens ?? 0 },
+        } } : {}),
       }
     });
   }
@@ -450,7 +420,10 @@ function flushEvents(state) {
 // currentToolCallId is intentionally sticky for the current turn so flush/completion
   // can still finalize as tool_calls even if the tool call was emitted before stream end.
 function computeFinishReason(state) {
-   return state.toolCallIndex > 0 || state.currentToolCallId
+  // A truncated answer must not reach a Chat client labelled "stop".
+  const capped = finishReasonFromIncompleteReason(state.responsesIncompleteReason);
+  if (capped) return capped;
+  return state.toolCallIndex > 0 || state.currentToolCallId
     ? OPENAI_FINISH.TOOL_CALLS
     : OPENAI_FINISH.STOP;
 }
@@ -585,9 +558,12 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     return null;
   }
 
-  // Response completed
-  if (eventType === "response.completed" || eventType === "response.done") {
-    // Extract usage from response.completed event
+  // Response reached a terminal state (completed, or capped by budget/filter)
+  if (eventType === "response.completed" || eventType === "response.done" || eventType === "response.incomplete") {
+    if (eventType === "response.incomplete") {
+      state.responsesIncompleteReason = data.response?.incomplete_details?.reason;
+    }
+    // Extract usage from the terminal event
     const responseUsage = data.response?.usage;
     if (responseUsage && typeof responseUsage === "object") {
       const inputTokens = responseUsage.input_tokens || responseUsage.prompt_tokens || 0;

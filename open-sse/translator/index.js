@@ -103,7 +103,18 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
       if (targetFormat !== FORMATS.OPENAI) {
         const fromOpenAI = requestRegistry.get(`${FORMATS.OPENAI}:${targetFormat}`);
         if (fromOpenAI) {
+          // Target translators build provider-native envelopes and intentionally omit
+          // translator-private fields. Preserve them so response conversion can map
+          // custom tools and namespaces after the request pivot.
+          const internal = {
+            _customToolNames: result._customToolNames,
+            _toolNameMap: result._toolNameMap,
+            _toolNamespaces: result._toolNamespaces
+          };
           result = fromOpenAI(model, result, stream, credentials);
+          for (const [key, value] of Object.entries(internal)) {
+            if (value !== undefined) result[key] = value;
+          }
         }
       }
     }
@@ -208,6 +219,11 @@ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
           finalResults.push(...(Array.isArray(converted) ? converted : [converted]));
         }
       }
+      // The intermediate translator may flush a final Chat chunk instead of
+      // null. Responses still needs its own flush after trailing usage arrives.
+      if (chunk === null && targetFormat !== FORMATS.OPENAI && sourceFormat === FORMATS.OPENAI_RESPONSES) {
+        finalResults.push(...(fromOpenAI(null, state) || []));
+      }
       results = finalResults;
     }
   }
@@ -269,6 +285,7 @@ export function initState(sourceFormat) {
       funcArgsDone: {},
       funcItemDone: {},
       customToolNames: new Set(),
+      toolNamespaces: new Map(),
       completedSent: false
     };
   }
