@@ -2,7 +2,7 @@ import { detectFormat, getTargetFormat, resolveTransport } from "../services/pro
 import { translateRequest } from "../translator/index.js";
 import { applyThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../translator/formats.js";
-import { normalizeClaudePassthrough, anchorClaudeCache } from "../translator/formats/claude.js";
+import { normalizeClaudePassthrough, anchorClaudeCache, lastCacheableToolIndex } from "../translator/formats/claude.js";
 import { createStreamController } from "../utils/streamHandler.js";
 import { refreshWithRetry } from "../services/tokenRefresh.js";
 import { createRequestLogger } from "../utils/requestLogger.js";
@@ -21,6 +21,8 @@ import { handleNonStreamingResponse } from "./chatCore/nonStreamingHandler.js";
 import { handleStreamingResponse, buildOnStreamComplete } from "./chatCore/streamingHandler.js";
 import { detectClientTool, isNativePassthrough } from "../utils/clientDetector.js";
 import { dedupeTools } from "../utils/toolDeduper.js";
+import { toolFilter } from "../utils/toolFilter.js";
+import { disclosureTools, HARD_TOOL_CEILING } from "../utils/toolDisclosure.js";
 import { takeRenamedToolNames } from "../utils/opencodeFingerprint.js";
 import { injectCaveman } from "../rtk/caveman.js";
 import { injectPonytail } from "../rtk/ponytail.js";
@@ -60,7 +62,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, toolDisclosure }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -222,6 +224,70 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     if (stripped.length > 0) {
       translatedBody.tools = deduped;
       log?.debug?.("TOOLDEDUP", `stripped ${stripped.length}: ${stripped.slice(0, 3).join(", ")}${stripped.length > 3 ? "..." : ""}`);
+    }
+  }
+
+  // Progressive tool disclosure: static filter (Phase 1) + BM25 selection (Phase 2).
+  // Outer gate has no tokenSaverEnabled guard — the cache_control stamp inside
+  // must run even when the bypass header is set (translators no longer stamp).
+  if (Array.isArray(translatedBody.tools) && translatedBody.tools.length > 0) {
+    const beforeN = translatedBody.tools.length;
+    const beforeBytes = log?.debug ? JSON.stringify(translatedBody.tools).length : 0;
+
+    if (tokenSaverEnabled) {
+      if (toolDisclosure?.filterEnabled) {
+        const filtered = toolFilter(translatedBody.tools, toolDisclosure);
+        if (filtered.length < translatedBody.tools.length) {
+          log?.debug?.("TOOLDISCLOSE", `filter: ${translatedBody.tools.length}→${filtered.length} tools`);
+          translatedBody.tools = filtered;
+        }
+      }
+
+      if (toolDisclosure?.disclosureEnabled) {
+        const { tools: disclosed, stats } = disclosureTools(translatedBody.tools, body, connectionId, toolDisclosure);
+        if (stats) {
+          log?.debug?.("TOOLDISCLOSE", `bm25: ${stats.before}→${stats.after} tools (-${stats.stripped})`);
+          translatedBody.tools = disclosed;
+        }
+      }
+
+      // Hard safety ceiling — applies whether or not disclosure itself is
+      // enabled/configured. Several providers 502 above ~128 tools; this
+      // isn't a compression tuning choice, it's preventing an outright
+      // failure. No-ops when the count is already at or below the ceiling
+      // (including the common case where disclosureEnabled already capped
+      // it much lower above).
+      if (translatedBody.tools.length > HARD_TOOL_CEILING) {
+        const { tools: capped, stats } = disclosureTools(translatedBody.tools, body, connectionId, {
+          maxTools: HARD_TOOL_CEILING,
+          alwaysInclude: toolDisclosure?.alwaysInclude,
+        });
+        if (stats) {
+          log?.debug?.("TOOLDISCLOSE", `ceiling: ${stats.before}→${stats.after} tools (-${stats.stripped}, safety cap ${HARD_TOOL_CEILING})`);
+          translatedBody.tools = capped;
+        }
+      }
+    }
+
+    // Stamp cache_control on the actual last tool — single source of truth.
+    // Translators strip incoming annotations but no longer stamp; this block
+    // runs after all disclosure passes so the annotation always lands correctly.
+    // Passthrough: skip when no filtering occurred (client's annotation was
+    // already on the correct last tool).
+    // Claude-format bodies only: cache_control is an Anthropic field that strict
+    // OpenAI-compatible upstreams reject. Anchor on the last tool that can be cached,
+    // since Anthropic rejects cache_control on a defer_loading tool (#3567).
+    const outFormat = passthrough ? sourceFormat : targetFormat;
+    if (outFormat === FORMATS.CLAUDE && translatedBody.tools.length > 0 && (!passthrough || translatedBody.tools.length !== beforeN)) {
+      for (const t of translatedBody.tools) delete t.cache_control;
+      const anchor = lastCacheableToolIndex(translatedBody.tools);
+      if (anchor !== -1) translatedBody.tools[anchor].cache_control = { type: "ephemeral", ttl: "1h" };
+    }
+
+    const afterN = translatedBody.tools.length;
+    if (log?.debug) {
+      const afterBytes = JSON.stringify(translatedBody.tools).length;
+      log.debug("TOOLDISCLOSE", `measure: ${beforeN}tools ${beforeBytes}B → ${afterN}tools ${afterBytes}B`);
     }
   }
 
