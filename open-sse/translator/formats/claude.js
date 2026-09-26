@@ -33,7 +33,7 @@ export function hasValidContent(msg) {
       block.type === CLAUDE_BLOCK.TOOL_USE ||
       block.type === CLAUDE_BLOCK.TOOL_RESULT ||
       block.type === CLAUDE_BLOCK.IMAGE ||
-      block.type === CLAUDE_BLOCK.DOCUMENT);
+      block.type === CLAUDE_BLOCK.DOCUMENT || block.type === "container_upload");
   }
   if (Array.isArray(msg.content)) {
     return msg.content.some(block =>
@@ -41,7 +41,7 @@ export function hasValidContent(msg) {
       block.type === CLAUDE_BLOCK.TOOL_USE ||
       block.type === CLAUDE_BLOCK.TOOL_RESULT ||
       block.type === CLAUDE_BLOCK.IMAGE ||
-      block.type === CLAUDE_BLOCK.DOCUMENT
+      block.type === CLAUDE_BLOCK.DOCUMENT || block.type === "container_upload"
     );
   }
   return false;
