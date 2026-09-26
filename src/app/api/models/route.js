@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getModelAliases, setModelAlias, getCustomModels } from "@/models";
 import { getDisabledModels } from "@/lib/disabledModelsDb";
+import { getSettings } from "@/lib/localDb";
 import { AI_MODELS } from "@/shared/constants/config";
 import { getProviderAlias } from "@/shared/constants/providers";
 import { getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
@@ -10,6 +11,16 @@ export async function GET() {
   try {
     const modelAliases = await getModelAliases();
     const disabled = await getDisabledModels();
+    const settings = await getSettings().catch(() => ({}));
+    const customPlugins = settings?.customPlugins || {};
+    const ivEnabled = Boolean(customPlugins.imageVision?.enabled);
+    const ivModels = new Set(customPlugins.imageVision?.models || []);
+    const tdEnabled = Boolean(customPlugins.thinkDeeper?.enabled);
+    const tdModels = new Set(customPlugins.thinkDeeper?.models || []);
+    const umEnabled = Boolean(customPlugins.unrestrictedMode?.enabled);
+    const umModels = new Set(customPlugins.unrestrictedMode?.models || []);
+    const smEnabled = Boolean(customPlugins.speedMode?.enabled);
+    const smModels = new Set(customPlugins.speedMode?.models || []);
 
     const models = AI_MODELS
       .filter((m) => {
@@ -22,18 +33,32 @@ export async function GET() {
         const providerAlias = getProviderAlias(m.provider) || m.provider;
         const routedModel = `${providerAlias}/${m.model}`;
         const c = getCapabilitiesForModel(m.provider, m.model);
+        const caps = {
+          vision: c.vision,
+          search: c.search,
+          reasoning: c.reasoning,
+          contextWindow: c.contextWindow,
+          maxOutput: c.maxOutput,
+        };
+        if (ivEnabled && (ivModels.has(fullModel) || ivModels.has(routedModel) || ivModels.has(m.model))) {
+          caps.vision = true;
+        }
+        if (tdEnabled && (tdModels.has(fullModel) || tdModels.has(routedModel) || tdModels.has(m.model))) {
+          caps.reasoning = true;
+          caps.thinkDeeper = true;
+        }
+        if (umEnabled && (umModels.has(fullModel) || umModels.has(routedModel) || umModels.has(m.model))) {
+          caps.unrestrictedMode = true;
+        }
+        if (smEnabled && (smModels.has(fullModel) || smModels.has(routedModel) || smModels.has(m.model))) {
+          caps.speedMode = true;
+        }
         return {
           ...m,
           fullModel,
           routedModel,
           alias: modelAliases[fullModel] || m.model,
-          caps: {
-            vision: c.vision,
-            search: c.search,
-            reasoning: c.reasoning,
-            contextWindow: c.contextWindow,
-            maxOutput: c.maxOutput,
-          },
+          caps,
         };
       });
 
@@ -46,6 +71,27 @@ export async function GET() {
     for (const m of customModels) {
       const fullModel = `${m.providerAlias}/${m.id}`;
       const c = getCapabilitiesForModel(m.providerAlias, m.id);
+      const caps = {
+        vision: c.vision,
+        search: c.search,
+        reasoning: c.reasoning,
+        contextWindow: c.contextWindow,
+        maxOutput: c.maxOutput,
+        ...(m.caps || {}),
+      };
+      if (ivEnabled && (ivModels.has(fullModel) || ivModels.has(m.id))) {
+        caps.vision = true;
+      }
+      if (tdEnabled && (tdModels.has(fullModel) || tdModels.has(m.id))) {
+        caps.reasoning = true;
+        caps.thinkDeeper = true;
+      }
+      if (umEnabled && (umModels.has(fullModel) || umModels.has(m.id))) {
+        caps.unrestrictedMode = true;
+      }
+      if (smEnabled && (smModels.has(fullModel) || smModels.has(m.id))) {
+        caps.speedMode = true;
+      }
       models.push({
         provider: m.providerAlias,
         model: m.id,
@@ -53,14 +99,94 @@ export async function GET() {
         fullModel,
         routedModel: fullModel,
         alias: modelAliases[fullModel] || m.id,
-        caps: {
-          vision: c.vision,
-          search: c.search,
-          reasoning: c.reasoning,
-          contextWindow: c.contextWindow,
-          maxOutput: c.maxOutput,
-          ...(m.caps || {}),
-        },
+        caps,
+      });
+    }
+
+    // Studio (Custom Models) entries: the callable name is the key clients use,
+    // so the plugin badge lookup must answer for the bare callName as well.
+    const { getStudioModels } = await import("@/lib/db/repos/modelEditorRepo.js");
+    let studioModels = [];
+    try {
+      studioModels = await getStudioModels();
+    } catch {
+      studioModels = [];
+    }
+    for (const s of studioModels) {
+      const c = getCapabilitiesForModel(s.provider, s.model);
+      const targetFull = `${s.provider}/${s.model}`;
+      const caps = {
+        vision: c.vision,
+        search: c.search,
+        reasoning: c.reasoning,
+        contextWindow: c.contextWindow,
+        maxOutput: c.maxOutput,
+      };
+      // A plugin applies when it names the studio name OR the model it calls.
+      const names = [s.callName, targetFull, s.model];
+      if (ivEnabled && names.some((n) => ivModels.has(n))) {
+        caps.vision = true;
+      }
+      if (tdEnabled && names.some((n) => tdModels.has(n))) {
+        caps.reasoning = true;
+        caps.thinkDeeper = true;
+      }
+      if (umEnabled && names.some((n) => umModels.has(n))) {
+        caps.unrestrictedMode = true;
+      }
+      if (smEnabled && names.some((n) => smModels.has(n))) {
+        caps.speedMode = true;
+      }
+      models.push({
+        provider: s.provider,
+        model: s.callName,
+        name: s.displayName || s.callName,
+        fullModel: `${s.provider}/${s.callName}`,
+        routedModel: s.callName,
+        alias: s.callName,
+        caps,
+        isStudio: true,
+      });
+    }
+
+    // Combos: aggregate the caps of their member models (worst-case window,
+    // OR-ed boolean capabilities) so a combo chip answers for its badge too.
+    const { getCombos } = await import("@/lib/localDb");
+    let combos = [];
+    try {
+      combos = await getCombos();
+    } catch {
+      combos = [];
+    }
+    const capsByAnyKey = models.reduce((acc, m) => {
+      if (m.fullModel) acc[m.fullModel] = m.caps;
+      if (m.routedModel) acc[m.routedModel] = m.caps;
+      if (m.model) acc[m.model] = m.caps;
+      return acc;
+    }, {});
+    for (const combo of combos) {
+      const members = Array.isArray(combo.models) ? combo.models : [];
+      const memberCaps = members.map((name) => capsByAnyKey[name]).filter(Boolean);
+      if (memberCaps.length === 0) continue;
+      const caps = {
+        vision: memberCaps.some((c) => c.vision),
+        search: memberCaps.some((c) => c.search),
+        reasoning: memberCaps.some((c) => c.reasoning),
+        thinkDeeper: memberCaps.some((c) => c.thinkDeeper),
+        unrestrictedMode: memberCaps.some((c) => c.unrestrictedMode),
+        speedMode: memberCaps.some((c) => c.speedMode),
+        contextWindow: memberCaps.reduce((min, c) => (c.contextWindow ? Math.min(min || Infinity, c.contextWindow) : min), null),
+        maxOutput: memberCaps.reduce((min, c) => (c.maxOutput ? Math.min(min || Infinity, c.maxOutput) : min), null),
+      };
+      models.push({
+        provider: "combo",
+        model: combo.name,
+        name: combo.name,
+        fullModel: combo.name,
+        routedModel: combo.name,
+        alias: combo.name,
+        caps,
+        isCombo: true,
       });
     }
 

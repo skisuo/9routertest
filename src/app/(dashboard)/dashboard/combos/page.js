@@ -371,7 +371,9 @@ export default function CombosPage() {
           <ul className="text-sm text-text-muted mt-2 flex flex-col gap-1">
             <li><span className="font-medium text-text-main">Fallback</span> — tries models in order (next on failure)</li>
             <li><span className="font-medium text-text-main">Round Robin</span> — rotates models across requests to spread load</li>
-            <li><span className="font-medium text-text-main">Fusion</span> — queries all models in parallel, then a judge synthesizes one answer. Best quality, but costs the most: every request bills all panel models + the judge (N+1 calls)</li>
+            <li><span className="font-medium text-text-main">Fastest</span> — picks the model with the lowest recent latency</li>
+            <li><span className="font-medium text-text-main">Cheapest</span> — picks the model with the lowest cost per token</li>
+            <li><span className="font-medium text-text-main">Fusion</span> — queries all models in parallel and merges their answers into one, giving the best quality at the highest cost because every request bills all panel models plus the judge (N+1 calls)</li>
           </ul>
           <p className="hidden text-xs text-text-muted mt-3 max-w-2xl">
             <span className="font-medium text-text-main">Cursor / Claude Default</span> create combos named exactly like those clients&apos; model IDs (e.g. <code className="font-mono">composer-2.5</code>, <code className="font-mono">opus</code>), seeded with the matching <code className="font-mono">cu/…</code> or <code className="font-mono">cc/…</code> route so traffic can hit 9router without the prefix.
@@ -516,6 +518,7 @@ export default function CombosPage() {
         activeProviders={activeProviders}
         getCaps={getCaps}
       />
+
 
       {/* Create Modal - Use key to force remount and reset state */}
       {showCreateModal && (
@@ -707,7 +710,7 @@ function CapacityAdapterSection({ capacityAdapter, onChange, activeProviders, ge
         <div className="min-w-0">
           <p className="text-sm font-medium">Vision Adapter</p>
           <p className="text-xs text-text-muted mt-0.5">
-            Your model can&apos;t read image/audio? Auto-switches to a model in the pool below.
+            Auto-switches to a pool model when yours cannot read image/audio.
           </p>
         </div>
       </div>
